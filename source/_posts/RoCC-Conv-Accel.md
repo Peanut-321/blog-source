@@ -310,11 +310,11 @@ Below is a trace of the first nine cycles, showing the burst start, steady state
    1 | fire read → addr 0x1008 |                         |    2     |
    2 | fire read → addr 0x1010 | deq elem[0] from word 0 |    3     | unpack begins, both engines active
    3 | fire read → addr 0x1018 | deq elem[1]             |    4     | inflight window full
-   4 |           —              | deq elem[2]             |    4     | issue blocked, unpack continues alone
+   4 |           —             | deq elem[2]             |    4     | issue blocked, unpack continues alone
    5 | fire read → addr 0x1020 | deq elem[3] (last)      |    4     | both fire: +1 from issue, −1 from unpack, net zero
-   6 |           —              | deq elem[4] from word 1 |    4     | inflight full again, issue waits
-   7 |           —              | deq elem[5]             |    4     |
-   8 |           —              | deq elem[6]             |    4     |
+   6 |           —             | deq elem[4] from word 1 |    4     | inflight full again, issue waits
+   7 |           —             | deq elem[5]             |    4     |
+   8 |           —             | deq elem[6]             |    4     |
    9 | fire read → addr 0x1028 | deq elem[7] (last)      |    4     | word 1 done, credit returned, issue fires
 ```
 
@@ -328,7 +328,20 @@ The only conflict is `inflightCount`. Both engines update it — issue +1, unpac
 
 ## Phase 4: Compute Datapath — LineBuffer & ConvEngine
 
-> TODO
+DMA delivers pixels one at a time in row-major order — row 0 left to right, then row 1, then row 2. But a 5×5 convolution at an output pixel (r, c) needs 25 pixels arranged as a 5×5 neighbourhood centred at (r+2, c+2). A single pixel from the DMA is useless on its own — the compute datapath must assemble an entire 5×5 window before the MAC unit can start.
+
+This is a data reshape problem. It splits naturally into two dimensions, so we pair two modules: LineBuffer handles the vertical direction (rows), ShiftWindow handles the horizontal direction (columns). LineBuffer collects 5 rows of 32 pixels from the DMA stream, then outputs one column of 5 vertically adjacent pixels per cycle. ShiftWindow buffers 5 consecutive columns from LineBuffer, shifting right each cycle, and outputs a full 5×5 window to the MAC unit. 
+
+**Why not read directly from SRAM?** Each output pixel needs values from 5 different rows. Fetching them directly would require 5 independent reads per cycle targeting 5 different addresses — five memory ports. LineBuffer replaces that with one write port (DMA feeds in one pixel per cycle) and one 5-wide read port (5 rows × same column). A 160-entry register file is far cheaper than a 5-port SRAM.
+
+```                                                            
+    sIdle ──► sPrime (load 5 rows)  ──► sActive (32 output rows)  ──► sDone
+```
+
+Zero-padding covers all four image borders through two mechanisms:
+
+- **Top / bottom:** Handled by what the five buffer rows hold. At output row 0, the top two slots are zero; at output row 31, the bottom two are zero. As the window slides down, real rows rotate in and out — no extra control logic.
+- **Left / right:** Each output row emits 36 columns (2 padding + 32 data + 2 padding). The `colValid` signal marks data columns. When low, ShiftWindow fills zeros regardless of `colOut`.
 
 ## Phase 5: Top-Level Integration & Master FSM
 
