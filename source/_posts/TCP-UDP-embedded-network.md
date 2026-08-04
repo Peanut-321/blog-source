@@ -1,10 +1,10 @@
 ---
-title: "TCP、UDP 与嵌入式网络学习笔记"
+title: "TCP 与嵌入式网络学习笔记"
 date: 2026-07-06 14:49:04
 lang: zh-CN
 tags:
   - TCP
-  - UDP
+  - CS144
   - 嵌入式网络
 categories:
   - 学习笔记
@@ -12,12 +12,10 @@ categories:
 
 ## 0. 学习目标
 
-- 理解 TCP 和 UDP 的工作原理
+- 理解 TCP 的基本模型与可靠传输机制
 - 能通过抓包解释协议行为
-- 能编写 TCP/UDP 客户端和服务器
-- 理解 lwIP 在嵌入式系统中的作用
+- 理解 TCP 与 IP、ARP、以太网之间的关系
 - 完成 CS144 ByteStream、Reassembler、TCP Receiver 和 TCP Sender
-- 实现一个面向嵌入式场景的 TCP/UDP 通信项目
 
 ## 第一阶段：TCP 连接基础
 
@@ -62,20 +60,7 @@ send(socket, "ABC", 3, 0);
 send(socket, "DEF", 3, 0);
 ```
 
-接收端可能一次收到：
-
-```text
-ABCDEF
-```
-也可能多次收到：
-
-```text
-AB
-CDE
-F
-```
-
-TCP 只保证最终能够收到 `ABCDEF`，但不保证一次 `send()` 对应一次 `recv()`。因此，嵌入式应用程序需要自行设计应用层消息分帧（Application-Layer Framing）：
+接收端可能一次收到 `ABCDEF`，也可能分多次收到 `AB`、`CDE` 和 `F`。TCP 只保证最终能够收到 `ABCDEF`，但不保证一次 `send()` 对应一次 `recv()`。因此，嵌入式应用程序需要自行设计应用层消息分帧（Application-Layer Framing）：
 
 ```text
 | 消息类型 | 数据长度 | 数据内容 |
@@ -99,11 +84,7 @@ TCP 只保证最终能够收到 `ABCDEF`，但不保证一次 `send()` 对应一
 
 #### 1.3 TCP 报文段与首部
 
-TCP 发送的基本单位称为 TCP 报文段：
-
-```text
-TCP 报文段 = TCP 首部 + 有效载荷
-```
+TCP 发送的基本单位称为 TCP 报文段，即 `TCP 报文段 = TCP 首部 + 有效载荷`。
 
 常见的 TCP 标志位：
 
@@ -134,12 +115,7 @@ TCP 报文段 = TCP 首部 + 有效载荷
 - 交换初始序列号（Initial Sequence Number，ISN）
 - 协商 MSS、Window Scale、SACK 等 TCP 选项
 
-假设：
-
-```text
-客户端 ISN = 200
-服务器 ISN = 900
-```
+假设客户端的 `ISN = 200`，服务器的 `ISN = 900`。
 
 完整过程：
 
@@ -340,65 +316,63 @@ SYN 和 FIN 占用序列号，因此可被确认和重传。纯 ACK 不占用序
 
 ### 3. 字节流与重组
 
-前面已经说明：TCP 传输的是连续 byte stream，而不是一条条 message。本阶段关注接收端如何在有限 buffer 中保存字节，并把乱序、重复、重叠的片段重新整理成连续数据。
+前面已经说明：TCP 传输的是连续字节流，而不是一条条消息。本阶段关注接收端如何在有限缓冲区中保存字节，并把乱序、重复、重叠的片段重新整理成连续数据。
 
 #### 3.1 ByteStream 抽象
-ByteStream可以理解成一个FIFO的字节管道：
-```
+
+ByteStream 可以理解为一个 FIFO 字节管道：
+
+```text
 写入端 write/push                  读取端 read/pop
         │                              ▲
         ▼                              │
        [ h ][ e ][ l ][ l ][ o ][ ... ]
 ```
-因此ByteStream的核心特征：
+ByteStream 的核心特征：
+
 1. 字节按顺序进入/读出
 2. 不保留消息边界
 3. 容量有限
-4. 可以结束输入--EOF
+4. 可以结束输入，即到达 EOF
 
 #### 3.2 发送缓冲区与接收缓冲区
-TCP不是直接将数据扔到网线上，其中间有缓冲区：
-```
+
+TCP 不会直接把应用程序的数据放到网络中，而是通过发送缓冲区和接收缓冲区中转：
+
+```text
 应用程序                   网络
-  │                        │                 
+  │                        │
   │ send()                 │   收到 TCP segment
   ▼                        ▼
 TCP 发送缓冲区          TCP 接收缓冲区
-  │                        │  
-  │ 拆成 TCP segment        │  recv（）
+  │                        │
+  │ 拆成 TCP segment        │  recv()
   ▼                        ▼
-网络                    应用程序 
+网络                    应用程序
 ```
 
 应用程序将数据交给 TCP 发送缓冲区，然后 TCP 协议栈会决定：
 
 - 什么时候发
-- 分几个segment发
+- 分成几个 segment 发送
 - 是否需要重传
 - 什么时候可以从发送缓冲区删除
 
 接收缓冲区同理。由于 TCP 是全双工的，两个方向的发送和接收互不影响。
 
-1. send() 只是把数据交给 TCP 发送缓冲区，不代表对方已经收到。
-
-2. recv() 是从 TCP 接收缓冲区读数据，不代表一次能读到完整消息。
-
+1. `send()` 只是把数据交给 TCP 发送缓冲区，不代表对方已经收到。
+2. `recv()` 是从 TCP 接收缓冲区读数据，不代表一次能读到完整消息。
 3. TCP 通过缓冲区和接收窗口控制发送速度，避免接收方被撑爆。
 
 #### 3.3 容量、反压（Backpressure）与 EOF
 
 **容量 Capacity**
 
-TCP 不能无限缓存数据。无论是操作系统里的 TCP，还是嵌入式中常见的 lwIP，发送端和接收端都有有限的 buffer。
+TCP 不能无限缓存数据。无论是操作系统中的 TCP，还是嵌入式中常见的 lwIP，发送端和接收端都只有有限的缓冲区。
 
-在 ByteStream 中，需要区分两个概念：
+在 ByteStream 中，需要区分两个概念：`capacity` 是缓冲区的最大容量，`remaining_capacity` 是当前还能继续写入的字节数。
 
-```text
-capacity            = buffer 的最大容量
-remaining_capacity  = 当前还能继续写入多少字节
-```
-
-例如 buffer 的最大容量是 8 字节，当前已经存了 `ABCDEF`：
+例如缓冲区的最大容量是 8 字节，当前已经存入 `ABCDEF`：
 
 ```text
 capacity = 8
@@ -406,13 +380,13 @@ buffer   = [ A B C D E F _ _ ]
 remaining_capacity = 2
 ```
 
-因此，容量不是指一条 TCP 连接总共最多能传多少数据，而是指某个时刻 buffer 能缓存多少还没被处理的字节。
+因此，容量不是一条 TCP 连接能够传输的数据总量，而是某一时刻缓冲区能够保存的待处理字节数。
 
 **反压 Backpressure**
 
 Backpressure 指的是：接收方处理不过来时，会反过来限制发送方继续发送。
 
-例如 Client 不断发送数据，而 Server 应用程序没有及时调用 `recv()`，那么 Server 的接收缓冲区会逐渐变满。此时 Server 会通过 TCP 接收窗口告诉 Client：我现在可接收的空间变少了。
+例如客户端不断发送数据，而服务器应用程序没有及时调用 `recv()`，服务器的接收缓冲区就会逐渐变满。此时服务器会通过 TCP 接收窗口通知客户端：当前可用空间正在减少。
 
 ```text
 Server 应用程序不读取
@@ -426,63 +400,25 @@ Client 可发送的数据量减少
 如果窗口变为 0，Client 暂停发送新的数据
 ```
 
-这就是 TCP 的流量控制。它的目的不是让网络更快，而是防止发送方把接收方的 buffer 撑爆。对于嵌入式系统来说，这一点尤其重要，因为 MCU 的内存通常很小，buffer 大小需要谨慎配置。
+这就是 TCP 的流量控制。它的目的不是提高网络速度，而是防止发送方耗尽接收方的缓冲区。对于嵌入式系统来说，这一点尤其重要，因为 MCU 的内存通常很小，缓冲区大小需要谨慎配置。
 
 **EOF（End of File）**
 
 EOF 表示这个方向的字节流已经结束，在 TCP 中通常对应收到对方的 FIN。
 
 ```c
-int n = recv(sock, buf, sizeof(buf), 0);
+int n = recv(sock, buf, sizeof(buf), 0); // n > 0：读到数据；n == 0：对方正常关闭发送方向，本端收到 FIN
 ```
 
-```text
-n > 0  : 读到了数据
-n == 0 : 对方正常关闭发送方向，本端收到 FIN
-```
-
-在 ByteStream 抽象中，真正 finished 需要同时满足：writer 已关闭，且 buffer 已读空。
-
-```c
-is_finished = EOF received && buffer empty;
-```
+在 ByteStream 抽象中，真正结束需要同时满足 Writer 已关闭且缓冲区已读空，即 `is_finished = EOF received && buffer empty`。
 
 #### 3.4 乱序、重复和重叠数据
 
-TCP 交给应用层的必须是连续、有序、无重复的字节流。但网络里来的 segment 不一定这么干净，接收端会遇到三种情况：
+TCP 交给应用层的必须是连续、有序且无重复的字节流，但网络中的报文段可能乱序（out-of-order）、重复（duplicate）或重叠（overlap）。
 
-```text
-out-of-order：后面的数据先到
-duplicate：同一段数据重复到达
-overlap：两段数据有部分重叠
-```
+例如原始数据是 `helloworld`，接收端却先收到 `[5,10) = world`。由于 `[0,5)` 尚未到达，`world` 只能暂存在 `pending_` 中；收到 `[0,5) = hello` 后，才能输出 `helloworld`。
 
-例如原始数据是 `helloworld`，但是先收到：
-
-```text
-[5,10) = world
-```
-
-这时不能把 `world` 交给应用层，因为前面的 `[0,5)` 还没到。它只能先放进 pending buffer。等后面收到：
-
-```text
-[0,5) = hello
-```
-
-才能输出：
-
-```text
-helloworld
-```
-
-重复数据则应该直接丢弃或裁剪：
-
-```text
-[0,5) = hello
-[0,5) = hello
-```
-
-第二段不会产生新的字节，不能重复输出。
+重复数据应直接丢弃或裁剪。例如连续两次收到 `[0,5) = hello` 时，第二段不会产生新字节，不能重复输出。
 
 重叠数据需要合并：
 
@@ -493,27 +429,11 @@ helloworld
 [3,10) = loworld
 ```
 
-所以 Reassembler 的工作可以总结为：
-
-```text
-1. 已经输出过的数据直接丢弃
-2. 乱序但还没法输出的数据先缓存
-3. 重复或重叠的数据要合并，避免重复保存
-```
+所以 Reassembler 的工作可以总结为：已经输出过的数据直接丢弃；暂时无法输出的乱序数据先缓存；重复或重叠的数据进行合并，避免重复保存。
 
 #### 3.5 区间重组
 
-实现时，每段 substring 可以抽象成一个 half-open interval：
-
-```text
-[first_index, first_index + data.size())
-```
-
-例如：
-
-```text
-first_index = 3, data = "lowor"  =>  [3,8)
-```
+实现时，每段 substring 可以抽象成半开区间 `[first_index, first_index + data.size())`。例如 `first_index = 3, data = "lowor"` 对应 `[3,8)`。
 
 `pending_` 用来保存已经到达但还不能输出的片段：
 
@@ -521,11 +441,7 @@ first_index = 3, data = "lowor"  =>  [3,8)
 std::map<uint64_t, std::string> pending_; // key 是 first_index
 ```
 
-例如：
-
-```text
-pending_[5] = "world"  =>  [5,10)
-```
+例如，`pending_[5] = "world"` 对应区间 `[5,10)`。
 
 处理重叠时，关键是先算出合并后的范围：
 
@@ -580,13 +496,7 @@ if ( first_index == next_index() ) {
 }
 ```
 
-这几行对应三个判断：
-
-```text
-1. 整段已经输出过：丢弃
-2. 前面一部分已经输出过：裁剪 prefix
-3. 正好接上 next_index：写入 ByteStream
-```
+这几行依次处理三种情况：整段已经输出则丢弃；前缀已经输出则裁剪 prefix；片段正好接上 `next_index` 则写入 ByteStream。
 
 如果不能马上输出，就和 `pending_` 里的片段尝试合并：
 
@@ -621,170 +531,15 @@ pending_[new_start] = new_data;
 
 需要注意的是：如果遍历过程中要删除 `map` 元素，应使用 iterator，而不是 range-for。`it = pending_.erase(it)` 会删除当前元素，并返回下一个有效位置。
 
-#### 3.6 CS144 Checkpoint 0：Networking Warmup 与 ByteStream
-
-Checkpoint 0 实现的是 `ByteStream`，它可以看成一个有容量限制的 FIFO 字节管道：
-
-```text
-Writer -> buffer -> Reader
-```
-
-实现中主要维护以下状态变量：
-
-```text
-capacity_  : buffer 最大容量
-buffer_    : 当前还没被读取的数据
-pushed_    : 历史累计写入字节数
-popped_    : 历史累计读取字节数
-closed_    : writer 是否关闭
-```
-
-写入时不能超过剩余容量：
-
-```cpp
-void Writer::push( string data )
-{
-  if ( closed_ ) {
-    return;
-  }
-
-  uint64_t writable = min( static_cast<uint64_t>( data.size() ), available_capacity() );
-  buffer_.append( data.substr( 0, writable ) );
-  pushed_ += writable;
-}
-```
-
-读取时也不能超过当前 buffer 中已有的数据：
-
-```cpp
-void Reader::pop( uint64_t len )
-{
-  uint64_t popable = min( len, static_cast<uint64_t>( buffer_.size() ) );
-  buffer_.erase( 0, popable );
-  popped_ += popable;
-}
-```
-
-这里需要区分 `close()` 和 `is_finished()`：
-
-```cpp
-bool Reader::is_finished() const
-{
-  return closed_ && buffer_.empty();
-}
-```
-
-`close()` 只表示 writer 不再写入；只有 buffer 也被读空，整个 stream 才算 finished。这个逻辑和 TCP 里的 FIN 很像：收到 FIN 以后，之前已经收到的数据仍然要交给应用层读取。
-
-#### 3.7 CS144 Checkpoint 1：Reassembler
-
-Checkpoint 1 实现的是 `Reassembler`。它的接口是：
-
-```cpp
-void Reassembler::insert( uint64_t first_index, string data, bool is_last_substring )
-```
-
-含义是：
-
-```text
-把 data 插入到 stream 的 first_index 位置
-is_last_substring 表示这段是否是整个 stream 的最后一段
-```
-
-例如：
-
-```cpp
-insert(5, "world", true);
-insert(0, "hello", false);
-```
-
-虽然 `world` 先到，但因为 stream index 0 开始的数据还没到，所以它必须先被缓存。等 `hello` 到达后，才能输出：
-
-```text
-helloworld
-```
-
-`insert()` 中定义了几个小工具函数，用来简化主流程。
-
-第一个是 `next_index()`，表示下一个想要写入 ByteStream 的 index：
-
-```cpp
-const auto next_index = [&] { return output_.writer().bytes_pushed(); };
-```
-
-第二个是 `flush_pending()`，每次写入一段连续数据后，都检查 pending 中有没有刚好能接上的片段：
-
-```cpp
-const auto flush_pending = [&] {
-  while ( true ) {
-    auto it = pending_.find( next_index() );
-    if ( it == pending_.end() ) {
-      break;
-    }
-
-    output_.writer().push( it->second );
-    pending_.erase( it );
-  }
-};
-```
-
-所以 Reassembler 的核心状态是：
-
-```text
-next_index : 下一个可以写入 ByteStream 的 index
-pending_   : 已经收到但暂时不能输出的乱序片段
-```
-
-最后是 EOF 处理：
-
-```cpp
-if ( is_last_substring ) {
-  eof_seen_ = true;
-  eof_index_ = first_index + data.size();
-}
-```
-
-注意：最后一段先到，不代表可以马上关闭。只有连续输出到 `eof_index_`，才可以 close：
-
-```cpp
-const auto try_close = [&] {
-  if ( eof_seen_ && eof_index_ == next_index() ) {
-    output_.writer().close();
-  }
-};
-```
-
-Checkpoint 1 完成后，可以更清楚地看到：TCP 接收端不是“收到什么就交给应用层什么”，而是必须先把网络中可能乱序、重复、重叠的数据整理成干净的连续字节流。
-
-```text
-network segments -> Reassembler -> ByteStream -> application
-```
-
 ## 第三阶段：TCP 接收端
 
 ### 4. 接收端可靠性
 
-Checkpoint 2 开始进入 TCP Receiver。前面 Reassembler 接收的是：
-
-```text
-first_index + data -> Reassembler
-```
-
-而 TCP Receiver 接收的是 TCP segment：
-
-```text
-seqno + SYN + payload + FIN -> TCPReceiver -> Reassembler
-```
-
-因此这一阶段的核心问题是：
-
-```text
-TCP 报文中的 seqno，如何转换成 Reassembler 需要的 stream index？
-```
+Checkpoint 2 开始进入 TCP Receiver。Reassembler 接收 `first_index + data`，而 TCP Receiver 接收包含 `seqno + SYN + payload + FIN` 的 TCP segment，再将 payload 交给 Reassembler。因此，这一阶段的核心问题是：如何把 TCP 报文中的 seqno 转换成 Reassembler 需要的 stream index？
 
 #### 4.1 序列号
 
-TCP 的 sequence number 不是给 packet 编号，而是给字节编号。
+TCP 的序列号不是给报文编号，而是给字节编号。
 
 例如发送 `hello`，TCP 看到的是 5 个连续字节：
 
@@ -793,23 +548,13 @@ seq:  1001 1002 1003 1004 1005
 data: h    e    l    l    o
 ```
 
-因此 sequence number 记录的是字节在 TCP 字节流中的位置，而不是 `send()` 被调用了几次。这也和前面的 byte stream 模型一致：TCP 不保留应用层消息边界。
+因此，序列号记录的是字节在 TCP 字节流中的位置，而不是 `send()` 被调用的次数。这也与前面的字节流模型一致：TCP 不保留应用层消息边界。
 
 #### 4.2 ISN 与 32 位序列号回绕
 
-TCP 的序列号不是固定从 0 开始，而是从一个 Initial Sequence Number 开始。
+TCP 的序列号不是固定从 0 开始，而是从初始序列号 ISN 开始。例如第一次握手时，客户端可能发送 `SYN, seq = 1000`。
 
-```text
-ISN = Initial Sequence Number
-```
-
-例如第一次握手时：
-
-```text
-Client SYN: seq = 1000
-```
-
-SYN 本身会占用一个 sequence number，所以第一个真正的数据字节不是 `1000`，而是 `1001`。
+SYN 本身会占用一个序列号，所以第一个真正的数据字节不是 `1000`，而是 `1001`。
 
 如果发送 `abc`：
 
@@ -827,25 +572,9 @@ stream index:
        a      b      c
 ```
 
-因此，收到 SYN 以后，payload 的位置需要从 TCP sequence space 转换到 stream index space。
+因此，收到 SYN 后，需要将 payload 的位置从 TCP 序列号空间转换到 ByteStream 索引空间：`stream index = absolute seqno - 1`。这里的 `-1` 来自 SYN 占用的一个序列号。
 
-```text
-stream index = absolute seqno - 1
-```
-
-这里的 `-1` 来自 SYN 占用了一个 sequence number。
-
-真实 TCP 报文里的 sequence number 是 32-bit：
-
-```text
-0 ~ 2^32 - 1
-```
-
-超过最大值后会 wrap around：
-
-```text
-4294967295 -> 0 -> 1 -> 2
-```
+真实 TCP 报文中的序列号是 32 位无符号数，范围为 `0 ~ 2^32 - 1`；超过最大值后会回绕，例如 `4294967295 -> 0 -> 1 -> 2`。
 
 因此 CS144 中使用 `Wrap32` 处理两种编号之间的转换：
 
@@ -854,17 +583,11 @@ Wrap32::wrap();    // 64-bit absolute seqno -> 32-bit TCP seqno
 Wrap32::unwrap();  // 32-bit TCP seqno -> 64-bit absolute seqno
 ```
 
-其中 32-bit TCP seqno 会回绕，而 64-bit absolute seqno 更适合程序内部计算。
+其中，32 位 TCP seqno 会回绕，而 64 位 absolute seqno 更适合程序内部计算。
 
 #### 4.3 累计确认
 
-ACK 表示的是：接收端下一个想要的 sequence number。
-
-它不是在说“我收到了哪个字节”，而是在说：
-
-```text
-我已经连续收到 ackno 之前的所有字节；下一个请从 ackno 开始发。
-```
+ACK 表示接收端下一个期待的序列号。它不是在说“我收到了哪个字节”，而是在说：“我已经连续收到 ackno 之前的所有字节，下一个请从 ackno 开始发送。”
 
 例如：
 
@@ -877,82 +600,23 @@ seq 1002: b
 seq 1003: c
 ```
 
-如果接收端已经连续收到了 `SYN + abc`，那么回复：
+如果接收端已经连续收到 `SYN + abc`，就会回复 `ack = 1004`，表示下一个期待的序列号是 1004。这就是累计确认（cumulative ACK）。
 
-```text
-ack = 1004
-```
-
-含义是：
-
-```text
-下一个想要 seq 1004
-```
-
-这就是 cumulative ACK。
-
-如果发生乱序：
-
-```text
-先收到 seq 1004 的 d
-但是 seq 1001 的 a 还没收到
-```
-
-ACK 不能跳到 `1005`，仍然只能保持：
-
-```text
-ack = 1001
-```
-
-因为 TCP 的 ACK 只能确认已经连续收到的前缀。
+如果先收到 `seq = 1004` 的 `d`，但 `seq = 1001` 的 `a` 尚未到达，ACK 不能跳到 1005，只能保持 `ack = 1001`，因为 TCP 的 ACK 只能确认已经连续收到的前缀。
 
 #### 4.4 接收窗口
 
-接收窗口表示 receiver 当前还能接收多少数据。
+接收窗口表示接收端当前还能接收多少数据，也称为 receive window、advertised window 或 `rwnd`。
 
-常见说法有：
+例如接收缓冲区容量为 1000 字节，当前已经缓存 300 字节，则 `available_capacity = 700`。接收端可以返回 `window_size = 700`，表示从 ackno 开始，发送端最多还能发送 700 字节。
 
-```text
-receive window
-advertised window
-rwnd
-```
-
-例如接收端 buffer 容量是 1000 字节，当前已经缓存了 300 字节：
-
-```text
-available capacity = 700
-```
-
-那么 receiver 返回的 window size 可以是：
-
-```text
-window_size = 700
-```
-
-含义是：
-
-```text
-从 ackno 开始，sender 最多还能发送 700 字节。
-```
-
-这就是 TCP 的 flow control。它的目的不是提高速度，而是防止发送端把接收端 buffer 撑爆。
-
-在嵌入式系统中，receive window 更重要，因为 RAM 通常有限，TCP buffer 不可能无限增长。
+这就是 TCP 的流量控制，目的是防止发送端耗尽接收缓冲区，而不是提高传输速度。在嵌入式系统中，接收窗口尤为重要，因为 RAM 通常有限，TCP 缓冲区不可能无限增长。
 
 #### 4.5 SYN、FIN 与序列号空间
 
-Checkpoint 2 最容易出错的地方，是区分 TCP sequence space 和 ByteStream stream index space。
+Checkpoint 2 最容易出错的地方，是区分 TCP 序列号空间和 ByteStream 索引空间。
 
-TCP sequence number 的计算规则是：
-
-```text
-SYN 占 1 个 sequence number
-payload 的每个 byte 占 1 个 sequence number
-FIN 占 1 个 sequence number
-```
-
-但是 ByteStream 的 stream index 只计算 payload。
+TCP 序列号的计算规则是：`SYN` 占 1 个序列号，payload 的每个字节占 1 个序列号，`FIN` 也占 1 个序列号；ByteStream 的 stream index 只计算 payload 字节。
 
 例如：
 
@@ -965,12 +629,7 @@ stream index:
               a      b      c
 ```
 
-因此：
-
-```text
-SYN/FIN 占 TCP seqno，但不占 stream index
-payload 既占 TCP seqno，也占 stream index
-```
+因此，`SYN/FIN` 占用 TCP seqno，但不占用 stream index；payload 则同时占用 TCP seqno 和 stream index。
 
 可以用下面这张图总结：
 
@@ -993,148 +652,201 @@ stream index:         0       1       2
 发送 window：window_size = ByteStream 剩余容量
 ```
 
-#### 4.6 CS144 Checkpoint 2：TCP Receiver
-
 ## 第四阶段：TCP 发送端
 
 ### 5. 发送端可靠性
 
+发送端主要负责四件事：
+
+1. 从应用层拿数据
+2. 根据窗口大小决定能不能发
+3. 记录已经发出但尚未确认的数据
+4. 超时仍未收到 ACK 时重传
+
 #### 5.1 发送缓冲区与未确认数据
+
+发送端内部有两类数据：
+
+- 还没发送的数据
+- 已经发送但尚未确认的数据，即 outstanding data，保存在 outstanding segments 中
+
+一个 outstanding segment 可能包含 `SYN`、`payload` 和 `FIN`。其中 `SYN`、`FIN` 各占用一个序列号，`payload` 占用 `payload.size()` 个序列号。
+
+因此，发送端必须记录：
+
+- `next_seqno`：下一个要发送的序列号
+- `bytes_in_flight`：已经发送但尚未确认的序列号数量
+
+虽然名称中带有 `bytes`，但在 CS144 中，`SYN` 和 `FIN` 也会使 `bytes_in_flight` 增加 1。
 
 #### 5.2 滑动窗口
 
+接收方通过滑动窗口告诉发送方当前还能接收多少数据。窗口大小来自 `TCPReceiverMessage.window_size`，发送方的可用窗口为 `available_window = window_size - bytes_in_flight`。
+
+如果 ACK 已经确认 `[0, 101)` 且 `window_size = 5`，那么允许发送的范围是 `[101, 106)`。假设发送方已经发送 `[101, 104)`，则 `bytes_in_flight = 3`、`available_window = 2`，此时最多还能发送两个字节。
+
+**ACK 到达后窗口如何滑动**
+
+```text
+发送方已经发送：
+seq = 101, payload = "ABC"
+seq = 104, payload = "DE"
+
+接收方返回：
+ack = 104
+```
+
+`ack = 104` 表示序列号小于 104 的内容均已收到，因此 `"ABC"` 可以从未确认队列中删除，`bytes_in_flight` 从 5 降为 2。释放出的窗口可以继续发送新数据，这就是窗口向右滑动。
+
+**零窗口**
+
+如果接收方返回 `window_size = 0`，表示接收缓冲区已经没有空间。但发送方不能永久停止，否则窗口重新打开后，发送方可能无法及时得知。
+
+在 CS144 中，可以将零窗口暂时视为大小为 1 的有效窗口，从而发送一个探测报文：
+
+```cpp
+effective_window = window_size == 0 ? 1 : window_size;
+```
+
 #### 5.3 超时与重传
+
+发送方发出报文后，会将其放入 outstanding queue，并启动重传计时器等待 ACK。
+
+**1. ACK 按时到达**
+
+如果 ACK 确认了新的数据：
+
+- 删除已经完全确认的报文
+- 减少 `bytes_in_flight`
+- 将 RTO 恢复为初始值
+- 如果还有未确认报文，重新启动计时器
+- 如果没有未确认报文，停止计时器
+
+**2. 等待 ACK 超时**
+
+如果计时器达到 RTO，但最早的未确认报文仍未得到确认：
+
+- 重传最早的未确认报文
+- 不创建新的报文
+- 不为它分配新的序列号
+- 原报文继续留在未确认队列中
+
+也就是说，哪个报文尚未确认，就使用原序列号重新发送该报文。
 
 #### 5.4 RTT 与 RTO
 
+- RTT：报文从发送方到达接收方，再由 ACK 返回发送方所经历的时间，即 `收到对应 ACK 的时间 - 发送报文的时间`
+- RTO：发送方在认为报文可能丢失之前等待的时间
+
+RTO 不能简单等于某一次 RTT：设置过短，网络暂时延迟也会触发不必要的重传；设置过长，报文真正丢失后又需要等待很久才能重传。
+
+CS144 Checkpoint 3 会直接提供初始 RTO，当前重点是正确维护计时器，而不是实现完整的 RTT 估计算法。
+
 #### 5.5 指数退避（Exponential Backoff）
 
-#### 5.6 重复 ACK 与快速重传
+为了避免网络已经拥塞时仍然频繁重传，每次超时重传后，发送方会将 RTO 加倍：`初始 RTO -> 2 × RTO -> 4 × RTO -> 8 × RTO`。
 
-#### 5.7 CS144 Checkpoint 3：TCP Sender
+只有 ACK 的确认范围真正向前移动，也就是确认了新的数据，才会将 RTO 恢复为初始值，并清零连续重传次数。
 
-## 第五阶段：TCP 流量与拥塞控制
+在 CS144 中，零窗口探测超时后仍然可以重传，但不进行指数退避，也不增加连续重传次数，因为此时未得到确认不一定是网络拥塞。
+
+## 第五阶段：TCP 流量与性能
+
+这一阶段以理解和面试为主，不实现拥塞控制算法。
 
 ### 6. TCP 性能
+TCP在保证可靠的基础上，一次允许多少数据处于网络中，以及如何避免把接收端或网络压垮
+```text
+实际发送窗口 = min(rwnd, cwnd)
+```
+#### 6.1 rwnd 与 cwnd
+TCP发送速度受到两个窗口限制：rwnd(接收窗口——保护接收端)，cwnd(拥塞窗口——保护网络)
 
-#### 6.1 流量控制与 rwnd
+- rwnd--接收窗口：
+接收方告诉发送方：“我的接收缓冲区还剩多少空间”。
+在checkpoint2中`message.window_size = writer().available_capacity;`，checkpoint3中的发送端收到后保存`receiver_window_size_ = msg.window_size`
 
-#### 6.2 拥塞控制与 cwnd
+所以rwnd解决的是flow control（流量控制）：防止发送方发的太快，撑爆接收方缓冲区。
 
-#### 6.3 慢启动
+- cwnd--拥塞窗口：（发送端内部状态，不是接收方提供的，不放进TCP首部）
+发送端自己维护拥塞窗口，根据当前网络状况，认为最多允许多少数据同时处于网络中。
 
-#### 6.4 拥塞避免
+#### 6.2 慢启动、拥塞避免与快速重传概览
+- Slow Start：慢启动
+  发送端从较小的cwnd开始，每当ACK返回，就增大cwnd，快速探测网络容量
+```
+第一个RTT：cwnd = 1MSS
+第二个RTT：cwnd = 2MSS
+...（1 -> 2 -> 4 -> 8 -> 16）
+```
 
-#### 6.5 快速重传与快速恢复
+- Congestion Avoidance: 拥塞避免
+当cwnd达到ssthresh(慢启动阈值)后，不再指数增长，改为较慢的线性增长。
 
-#### 6.6 带宽时延积（Bandwidth-Delay Product）与吞吐率
+- 发生超时
+如果一直没有收到ACK，最终触发RTO，发送端认为网络可能出现了严重拥塞
 
-#### 6.7 CS144 Checkpoint 4：Measuring the Real World
+- 快速重传
+接收端连续收到后面的报文（说明链路没断，一切正常），但是中间缺少一个报文，会返回相同的ACK（其中一个报文走丢了）
+```
+发送：1  2  3  4  5
+接收：1  2  ×  4  5
 
-## 第六阶段：网络接口与 IP 路由器
+ACK： 2  3  3  3  3
+```
+多个重复ACK表示：网络还在传输数据，但是中间某个包丢失了 
+->TCP在收到三个Duplicate ACK后，不需要等待RTO，直接重传缺失报文。
+
+#### 6.3 带宽时延积与吞吐率
+- Bandwidth-Delay Product,(BDP)--带宽时延积
+BDP = 带宽xRTT
+表示要让一条网络链路始终保持繁忙，网络中需要同时存在多少未确认数据。
+
+TCP 吞吐率 ≈ min(链路带宽, rwnd / RTT, cwnd / RTT)
+
+## 第六阶段：网络接口与 IP
 
 ### 7. 链路层与网络层
 
-#### 7.1 以太网帧与 MAC 地址
+TCP Segment 不能直接在以太网上传输。发送数据时，协议栈会逐层添加首部，最终将数据交给网卡。
 
-#### 7.2 ARP
+**发送流程：**
 
-#### 7.3 IPv4 数据报
+```text
+应用数据
+   ↓
+TCP Segment
+   ↓
+IPv4 Datagram
+   ↓
+确定下一跳
+   ↓
+ARP 查询下一跳的 MAC 地址
+   ↓
+Ethernet Frame
+   ↓
+网卡驱动 → DMA → MAC → PHY → 网络
+```
 
-#### 7.4 网络接口
+**下一跳的判断：**
 
-#### 7.5 IP 路由与最长前缀匹配
+- 目标 IP 与本机位于同一子网：下一跳是目标设备。
+- 目标 IP 与本机位于不同子网：下一跳是默认网关。
 
-#### 7.6 CS144 Checkpoint 5：Network Interface
+IP 地址用于确定数据的最终目的地，MAC 地址用于完成当前一跳的传输。
 
-#### 7.7 CS144 Checkpoint 6：IP 路由器
+**嵌入式网络中的常见故障：**
 
-#### 7.8 CS144 Checkpoint 7：端到端互联网
+- Link 状态未更新；
+- ARP Cache 异常；
+- IP 地址与子网掩码不匹配；
+- 默认网关配置错误；
+- MTU 或 MSS 设置不当；
+- 网卡驱动没有把收到的数据交给协议栈。
 
-## 第七阶段：UDP 与协议选择
 
-### 8. UDP
+## 阶段总结
 
-#### 8.1 数据报模型与消息边界
+至此，本文完成了对 TCP 基本模型、连接管理、可靠传输、流量控制与发送端重传机制的梳理，并结合 CS144 Checkpoint 0–3 实现了 ByteStream、Reassembler、TCP Receiver 和 TCP Sender。
 
-#### 8.2 UDP 首部与校验和
-
-#### 8.3 `sendto()`、`recvfrom()` 与 UDP 回显
-
-#### 8.4 广播与多播
-
-#### 8.5 应用层序列号、超时与重传
-
-#### 8.6 TCP 与 UDP 对比
-
-#### 8.7 典型嵌入式使用场景
-
-## 第八阶段：嵌入式网络与 lwIP
-
-### 9. lwIP 架构
-
-#### 9.1 协议栈分层与数据流
-
-#### 9.2 netif
-
-#### 9.3 pbuf
-
-#### 9.4 tcp_pcb 与 udp_pcb
-
-#### 9.5 Raw API
-
-#### 9.6 Netconn API
-
-#### 9.7 Socket API
-
-### 10. 嵌入式约束
-
-#### 10.1 固定大小缓冲区与内存池
-
-#### 10.2 环形缓冲区
-
-#### 10.3 定时器与超时
-
-#### 10.4 RTOS 任务、队列与线程安全
-
-#### 10.5 网络字节序与二进制协议
-
-#### 10.6 心跳、看门狗与断线重连
-
-#### 10.7 链路状态、DHCP 与 DNS
-
-## 第九阶段：最终项目
-
-### 11. 虚拟嵌入式遥测设备
-
-#### 11.1 项目需求与系统架构
-
-#### 11.2 自定义二进制帧格式
-
-#### 11.3 TCP 传输模式
-
-#### 11.4 UDP 传输模式
-
-#### 11.5 固定内存与缓冲区管理
-
-#### 11.6 心跳、超时与断线重连
-
-#### 11.7 抓包、丢包和断线测试
-
-### 12. 项目记录
-
-#### 12.1 状态机与数据结构
-
-#### 12.2 内存使用情况
-
-#### 12.3 测试结果
-
-#### 12.4 抓包分析
-
-#### 12.5 README 与求职展示
-
-## 第十阶段：问题与总结
-
-### 13. 尚未理解的问题
-
-### 14. 学习总结
+受当前时间安排限制，网络接口、UDP 与 lwIP 暂不展开。后续在嵌入式项目中实际使用这些内容时，再继续学习和补充记录。
