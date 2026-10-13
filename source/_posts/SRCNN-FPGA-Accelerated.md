@@ -1,6 +1,8 @@
 ---
 title: "SRCNN FPGA- Accelerated"
 date: 2026-10-13 00:00:00
+categories:
+  - Tech Note
 ---
 
 ## 1. SRCNN 网络结构与计算分析
