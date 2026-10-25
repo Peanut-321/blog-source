@@ -17,7 +17,9 @@ categories:
 > - CHW/OIHW 如何映射到内存？空间与通道的数据复用机会分别在哪里？
 > - 哪些结论来自静态计算，哪些瓶颈还需要综合或板上测量确认？
 
-PS 端先通过 Bicubic（双三次插值），根据原图已有的像素估计新增位置的像素值，将低分辨率图像放大到目标尺寸。PL 端接收形状为 `1×255×255` 的单通道图像，再利用 SRCNN 的三层卷积重建图像细节。
+**“一张图进入 SRCNN 后，三层卷积分别在算什么，需要多少计算？”**
+
+软件侧先通过 Bicubic（双三次插值），根据原图已有的像素估计新增位置的像素值，将低分辨率图像放大到目标尺寸。PL 端接收形状为 `1×255×255` 的单通道图像，再利用 SRCNN 的三层卷积重建图像细节。
 
 ```text
 低分辨率图像 → Bicubic 放大 → SRCNN 三层卷积 → 改善图像细节
@@ -78,25 +80,19 @@ bias 数 = Cout
 
 ## 2. Golden Reference 与数值验证
 
-> 写作问题清单：
->
 > - Golden 的功能契约、数据布局、累加顺序与逐层输出是什么？
 > - 如何使用手算和独立 oracle 验证 Golden 自身？
 > - 测试是否覆盖边缘、角落、通道映射、负数、ReLU 和非法输入？
 > - 比较哪些误差指标？容差如何确定？失败如何定位到具体层和坐标？
 > - 如何固定输入、权重、随机种子、checksum 和工具版本，保证可复现？
 
+**“在做硬件之前，怎样先得到可信的正确答案，供后续核对？”**
+
 ### 2.1 功能契约与数据布局
 
 Golden Reference 使用 float32 计算 SRCNN，为 HLS 仿真和 FPGA 输出提供比较基准。课程提交版遵循第一章的网络结构、replicate-edge 边界规则及 CHW/OIHW 布局；三层 stride 均为 1，每个输出通道对应一个 bias。
 
-逐层比较时，按以下索引对应输入、参数和输出：
-
-```text
-激活 CHW：[channel][row][column]
-权重 OIHW：[output-channel][input-channel][kernel-row][kernel-column]
-Bias：bias[output-channel]
-```
+逐层比较沿用第一章的张量索引，并以 `bias[output-channel]` 对应各输出通道的偏置。
 
 每个输出元素采用 bias-first 累加顺序：先用对应输出通道的 bias 初始化累加器，再按照输入通道、kernel 行、kernel 列的顺序逐项乘加。Conv1 和 Conv2 在完成全部累加后执行 ReLU；Conv3 直接输出累加结果，不执行额外激活。
 
@@ -176,6 +172,8 @@ abs(golden - oracle) <= atol + rtol × abs(oracle)
 > - 定点结果相对 float Golden 的误差如何传播？如何区分实现误差与图像质量？
 > - 不同位宽在精度、DSP、存储和时序之间有什么取舍？最终选择依据是什么？
 
+**“怎样用有限位宽表示和计算这些数，既节省硬件，又不损失过多精度？”**
+
 ### 3.1 动态范围与位宽分配
 
 定点化的核心问题是：**如何用有限位宽覆盖数值范围，同时保留足够的小数精度？**
@@ -212,16 +210,8 @@ abs(golden - oracle) <= atol + rtol × abs(oracle)
 wide_acc_t accumulator = ...;
 data_t output = accumulator;
 ```
-Conv1/2 的处理顺序为：
 
-```text
-宽位累加 → ReLU → 转换为层输出类型 → 下一层
-```
-Conv3 不执行 ReLU，其处理顺序为：
-
-```text
-宽位累加 → 转换为最终输出类型
-```
+对应 3.1 的数据通路，Conv1/2 在 ReLU 之后转换为层输出类型；Conv3 不执行 ReLU，直接将宽位累加结果转换为最终输出类型。
 
 ### 3.3 精度与硬件成本的取舍
 
@@ -242,7 +232,7 @@ Conv3 不执行 ReLU，其处理顺序为：
 | 存储 | 权重、特征图和 FIFO 占用更小 | BRAM/URAM 和数据传输需求更大 |
 | 时序 | 较窄的运算通常更容易满足时钟要求 | 加法、乘法及布线可能更复杂，需要更多流水级 |
 
-总位宽固定时，主要取舍是表示范围与小数精度；总位宽变化时，还会影响存储容量和运算成本。实际 DSP、BRAM 和时序收益取决于器件结构与综合映射，需要以报告为准。
+实际 DSP、BRAM 和时序收益取决于器件结构与综合映射，需要以报告为准，不能仅按位宽比例推算。
 
 ### 3.4 本项目的 Q20.12 选择依据
 
@@ -263,9 +253,9 @@ Q24.8 将 Conv1 中 1,205 个原本非零的权重量化为零，而 Q20.12 降�
 
 Q18.14 的数值一致性更高，但 Q20.12 已满足工程精度门限，是已测试配置中小数位最少的通过者，因此被选入后续硬件验证。Q18.14 尚未完成同等硬件评估，不能据此认定 Q20.12 是所有候选格式中的最优方案。
 
-精度通过后，还需要检查调度与实现结果。第一次切换至 Q20.12 时，Conv1 MAC 循环的 II 从 1 增至 2，MAC pipeline 的 DSP 从 16 降至 8，吞吐随之下降。随后保持相同数值规则，将引用辅助函数中的 `+=` 改为直接写回表达式，改变 HLS 识别的累加反馈结构，恢复了 II=1 和 16 个 MAC pipeline DSP，输出仍逐位一致。
+精度通过后，还需要检查调度与实现结果。首次切换至 Q20.12 时，Conv1 MAC 循环的 II 从 1 增至 2；修复累加写回结构后恢复为 II=1。具体修改、资源代价与 RTL 对照结果见 4.3 的案例二。
 
-最终布线后的完整设计资源如下：
+前期 Q24.8/Q20.12 对比实现的布线后资源如下，区别于第八章记录的最终 V3 集成版本：
 
 | 资源 | Q24.8 | Q20.12 |
 |---|---:|---:|
@@ -274,7 +264,7 @@ Q18.14 的数值一致性更高，但 Q20.12 已满足工程精度门限，是�
 | FF | 16,456 | 17,546 |
 | BRAM tile 等效数量 | 97 | 97.5 |
 
-Q20.12 在 5 ns、约 200 MHz 下通过布线时序，setup WNS 为 +0.107 ns。两种格式的数据字均为 32 bit，因此存储和传输宽度没有减小，资源占用也基本相近。两次独立实现运行存在布局布线差异，小幅资源变化不能全部归因于数值格式。
+该次 Q20.12 实现在 5 ns、约 200 MHz 下通过布线时序，setup WNS 为 +0.107 ns。两种格式的数据字均为 32 bit，因此存储和传输宽度没有减小，资源占用也基本相近。两次独立实现运行存在布局布线差异，小幅资源变化不能全部归因于数值格式。
 
 Q20.12 最终通过范围检查、RTL 与板级一致性验证：这次格式调整提高了精度，同时保持相近的硬件成本与原有 Conv1 MAC 吞吐。
 
@@ -283,6 +273,8 @@ Q20.12 最终通过范围检查、RTL 与板级一致性验证：这次格式调
 > - 为什么选择当前架构？与自然循环、整帧缓存或分块方案相比有什么取舍？
 > - 数据通路、控制通路和存储分别如何划分？数据流顺序如何定义？
 > - 目标吞吐和实际资源预算如何决定各层并行度？
+
+**“怎样组织计算、缓存和流水线，把三层卷积变成高效的 FPGA 电路？”**
 
 第一章计算的两层中间特征图合计约 23.81 MiB。若每帧都写回 DDR 再读入，会额外传输约 47.63 MiB；整帧保留在片上也超出本设计的存储预算。因此，本项目采用行缓存与层间 FIFO，只保留窗口计算需要的历史数据，并让下一层直接消费上一层结果。
 
@@ -308,7 +300,7 @@ DDR 输出
 
 其中，`axis_to_scalar` 将 AXI-Stream 数据转换为内部数值流，`scalar_to_axis` 则将计算结果封装为 AXI-Stream 输出。Conv1 和 Conv3 内部使用 line buffer 与 window 复用邻域数据，中间特征通过 FIFO 传递给下一层。
 
-这一架构用行缓存复用相邻窗口的数据，用 FIFO 直接传递层间特征，减少了中间结果的 DDR 往返；`DATAFLOW` 则让各阶段重叠执行。FIFO 满时上游暂停，空时下游等待，因此仍需管理数据顺序、边界复制、反压和流水线排空。
+`DATAFLOW` 使上述各阶段能够重叠执行；窗口更新、边界复制、反压与流水线排空的处理见 4.2。
 
 **图像与模型的访问路径**
 
@@ -338,7 +330,7 @@ DDR ── AXI4 读取 ──→ SRCNN 的 m_axi_model_mem
                            卷积计算
 ```
 
-DMA 和 SRCNN 都是 PL 中的硬件，PS 运行控制软件。图中的 DDR 数据访问均经过 PS DDR 控制器、HP0 和存储互联；模型读取请求由 SRCNN 自己发出，不经过 DMA。
+DMA 和 SRCNN 都是 PL 中的硬件，PS 运行控制软件。最终板级版本中，图中的 DDR 数据访问均经过存储互联、PS 的 HPC0 接口和 DDR 控制器。
 
 在图像路径中，PS 配置 DMA 的 buffer 地址与传输长度。DMA 从 DDR 读取输入，经 AXI-Stream 送入加速器；计算完成后，再接收加速器的输出流并写回 DDR。
 
@@ -350,13 +342,13 @@ conv1_weights[...] = model[index];
 
 HLS 将数组访问转换为 `m_axi_model_mem` 接口上的 AXI4 读请求。加速器主动发出地址，从 DDR 读取权重与 bias，保存到各层本地参数数组，这一过程不经过 AXI DMA。
 
-两条路径都经存储互联和 PS 的 HP0 接口访问 DDR。PS 配置地址与启动命令，PL 硬件负责传输；每次调用先由 `load_runtime_model()` 将全部 8,129 个参数载入本地数组，再启动 `DATAFLOW` 推理。
+每次调用先由 `load_runtime_model()` 将全部 8,129 个参数载入本地数组，再启动 `DATAFLOW` 推理。
 
 内部特征流按“空间位置优先、通道依次输出”的顺序传递：Conv1 在同一位置输出 64 个通道后，再处理下一个位置；Conv2 则在同一位置接收这 64 个通道并输出 32 个通道。这与 Golden 的 CHW 内存布局不同，验证时需要按逻辑坐标对应数据。
 
 **并行度的选择**
 
-Conv1 最终采用 OC4：将 64 个输出通道分成 16 组，每组同时计算 4 个通道。每个通道仍需完成 9×9 的 81 项 MAC，并行的是四个通道，而非同时展开 81 项乘法。四个 lane 共享窗口像素，分别读取权重并更新累加器；权重分为四个独立 bank，使四路计算能同时读取各自的权重。
+Conv1 最终采用四个输出通道并行的 OC4 结构，具体分组、输入复用和权重供给方式见 4.1。本节先说明三层的选择依据。
 
 各层的选择依据与 Q20.12 综合结果如下：
 
@@ -388,6 +380,9 @@ OC4 将 64 个输出通道分为 16 组，每组同时计算 4 个通道。四�
     ├→ × 通道 2 的权重 → sum2
     └→ × 通道 3 的权重 → sum3
 ```
+
+权重按四个 lane 分为独立的 bank，使四路计算能够同时读取各自的权重。
+
 接着取窗口的下一个像素，继续更新四个累加器。遍历完 81 个像素后，四个通道完成计算，经过 ReLU 和输出类型转换，再依次写入 FIFO，然后处理下一组通道：
 
 ```text
@@ -443,13 +438,7 @@ sum[31] += x0 × W[31][0]
 > - 32 个通道的空间窗口如何组织？800 项归约如何分组和流水化？
 > - 如何处理部分和、累加精度与最终输出转换？
 
-Conv3 先保存多通道邻域，再复用计算资源完成重建。Conv2 在每个位置输出 32 个特征，而 Conv3 需要这 32 个通道各自的 5×5 邻域，共 800 个数：
-
-```text
-当前行缓存：[32][255]       接收 Conv2 送来的一行数据
-历史行缓存：4 行 × 32 通道   保存之前四行，并包含左右 padding 的列宽
-窗口：     [32][5][5]      保存本次计算所需的 800 个值
-```
+Conv3 先保存多通道邻域，再复用计算资源完成重建。Conv2 在每个位置输出 32 个特征，而 Conv3 需要这 32 个通道各自的 5×5 邻域，共 800 个数。当前行、历史行与窗口的具体数组尺寸统一列在 4.2。
 
 例如，计算输出 `(10,10)`，需要每个通道第 8～12 行、第 8～12 列的数据。当前行提供第 12 行，历史行缓存提供前四行；窗口保留最近五列，组成完整的 5×5 区域。32 个通道的窗口值分别乘以对应权重，累加 800 项，再转换为最终输出类型，不执行 ReLU。
 
@@ -487,7 +476,7 @@ Conv3 采用相同方式，但需要保存 32 个通道的 5×5 邻域。两层�
 
 FIFO 满时，`write()` 等待空位；FIFO 空时，`read()` 等待新数据。其他阶段仍可处理已有数据，直到各自遇到阻塞，因此反压逐级传播，而非整条流水线立即同时暂停。
 
-AXI-Stream 只有在 `TVALID && TREADY` 时才完成一拍传输，类似 Chisel 的 `.fire`。输出受阻时，当前数据和附带标记必须保持稳定。`scalar_to_axis()` 为第 65,025 个输出像素设置 `TLAST=1`；这一拍完成握手后，整帧输出才传输结束。
+整帧输出以最后一个像素成功传输为结束标志；对应的 AXI-Stream 握手、反压信号保持与 TLAST 约定见 5.2。
 
 ### 4.3 Pipeline、Unroll 与 DATAFLOW
 
@@ -623,6 +612,8 @@ DSP 从 8 增至 16，反映了运算资源共享程度的变化：II=2 时使�
 > - 输入、输出与权重通过什么路径传输？DMA byte count、对齐和 burst 如何设置？
 > - 如何应对反压、尾包、超时与错误恢复？有效带宽如何测量？
 
+**“这套卷积电路通过什么接口接收命令、获取数据，并把结果送出去？”**
+
 PS 与 PL 通过以下 AXI 接口连接，方向表示访问请求的发起方：
 
 | 接口 | 谁主动发起访问 | 本项目中的用途 |
@@ -635,7 +626,7 @@ PS 与 PL 通过以下 AXI 接口连接，方向表示访问请求的发起方�
 
 ### 5.1 控制寄存器、启动与状态协议
 
-PS 通过 AXI-Lite 读写 DMA 和 SRCNN 的控制寄存器，配置地址、发出启动命令并检查状态。图像由 DMA 搬运，模型参数由 SRCNN 的 AXI master 读取。
+PS 通过 AXI-Lite 读写 DMA 和 SRCNN 的控制寄存器，配置地址、发出启动命令并检查状态。
 
 两个 IP 各有一段控制地址：
 
@@ -741,11 +732,13 @@ TLAST 表示整帧结束，而不是每行结束。输出端由 `scalar_to_axis(
 
 **4. TVALID / TREADY：握手成功才算完成传输**
 
-只有 `TVALID=1` 且 `TREADY=1` 的时钟上升沿，才完成一拍传输：前者表示发送方提供了有效数据，后者表示接收方能够接收。
+只有 `TVALID=1` 且 `TREADY=1` 的时钟上升沿，才完成一拍传输，类似 Chisel 中的 `.fire`：前者表示发送方提供了有效数据，后者表示接收方能够接收。
 
 当 `TVALID=1`、`TREADY=0` 时，发送方必须保持 TVALID，并保持 TDATA、TKEEP、TSTRB 和 TLAST 不变，直到握手完成。因此，即使最后一拍已经设置 `TLAST=1`，只要接收方尚未就绪，这一拍就仍未传输完成。
 
 ### 5.3 数据路径与 DMA 配置
+
+图像经 DMA 传输，模型由 SRCNN 自行读取，完整路径见第四章。DMA 采用 Simple 模式，每次按 5.1 的顺序配置输入、输出 buffer 的物理地址和传输字节数，再由硬件完成整帧搬运，无须 CPU 逐个传送像素。模型参数不计入图像 DMA 的传输长度。
 
 ### 5.4 反压、错误恢复与带宽测量
 
@@ -758,6 +751,73 @@ TLAST 表示整帧结束，而不是每行结束。输出端由 `scalar_to_axis(
 > - cache flush/invalidate、DMA 启动顺序、等待和超时如何处理？
 > - 连续多帧、重复运行与 overlay reload 是否可靠？软件开销如何记录？
 
+**“卷积硬件已经做好了，ARM 上的 Python 程序怎样让它处理一张图？”**
+
+### 6.1 PS/PL 任务划分
+
+图像预处理以及模型、输入的定点编码由软件侧提前完成。当前板级 runner 直接读取准备好的数据包，不在每次推理时重复这些操作。
+
+**PS：准备、调度与检查**
+
+```text
+加载 FPGA 硬件
+    ↓
+分配 DDR buffer，放入输入和模型
+    ↓
+配置地址，启动 DMA 和 SRCNN
+    ↓
+等待完成，检查错误
+    ↓
+读取输出，与预期结果比较
+```
+
+**PL：搬运与计算**
+
+- DMA：读取输入图像，写回输出图像。
+- SRCNN IP：读取模型参数，执行 Conv1、Conv2、Conv3，以及前两层的 ReLU。
+- 本地缓存与 FIFO：保存权重、复用邻域像素，并连接各计算阶段。
+
+如需将输出还原为图像或计算 PSNR，也由软件侧完成。
+
+### 6.2 Overlay 加载与数据 Buffer 管理
+
+**1. Overlay：加载硬件并获取控制接口**
+
+加载 overlay，使 FPGA 具备 SRCNN 加速器及其配套电路。它对应一对匹配的文件：
+
+- `.bit`：配置 FPGA，在 PL 中形成 DMA、SRCNN 等硬件。
+- `.hwh`：描述硬件的接口、地址等信息，供 PYNQ 解析。
+
+**2. 连续内存 buffer：提供硬件可访问的内存**
+
+通过 PYNQ 的 `allocate()` 分配物理连续的 DDR 内存，并通过 `physical_address` 获取其物理地址。输入、输出和模型分别使用独立的 buffer，存放待计算图像、FPGA 写回的结果，以及权重与 bias；确认硬件完成访问后再释放。
+
+**3. dtype、shape 与打包：保持软硬件的数据约定一致**
+
+- **dtype**：约定每个元素的存储类型、字节数及内容含义。
+- **shape**：图像的逻辑维度为 `[1][255][255]`，传输时按约定顺序展开为一维的 65,025 个元素，而不是改变图像本身的内容。
+- **打包**：约定元素在内存中如何排列、如何传输，使 PS 和 PL 对同一段数据的解释一致。
+
+### 6.3 缓存同步与推理执行流程
+
+**1. Cache flush / invalidate**
+
+CPU 写入 buffer 后，新数据可能仍在 CPU 缓存中，尚未更新到 DDR。为避免 DMA 和 SRCNN 读到旧数据，runner 在启动硬件前对三个 buffer 执行 `flush()`：
+
+```text
+CPU 写入输入和模型 -> buffer.flush() -> 将缓存中的更新写回 DDR -> 启动硬件读取
+```
+
+反过来，硬件将结果写入 DDR 后，CPU 缓存中可能仍保留输出 buffer 的旧内容。因此，确认计算与传输完成后，需要先执行 `invalidate()`，再读取结果：
+
+```text
+结果写入 DDR -> 确认计算与传输完成 -> output_buffer.invalidate() -> CPU 读取
+```
+
+**2. 等待与超时**
+
+DMA 启动顺序与完成判断沿用 5.1 的约定。等待期间，runner 轮询状态、检查 DMA 错误，并设置可配置的超时时间，避免无限等待。
+
 ## 7. PL/PS 系统集成
 
 > - HLS IP 如何封装并接入 Vivado block design？时钟、复位和地址如何配置？
@@ -766,12 +826,90 @@ TLAST 表示整帧结束，而不是每行结束。输出端由 `scalar_to_axis(
 > - ILA 应观察哪些握手、状态和数据？如何定位板上停滞或输出错误？
 > - 板卡、工具、镜像与 bitstream 版本如何记录，怎样复现上板流程？
 
+**“怎样把这些模块在 Vivado 中连接起来，让整套系统真正跑在开发板上？”**
+
+**1. HLS IP 如何接入 Vivado？**
+
+将 HLS 模块导出为 IP，在 Block Design 中连接 PS、DMA、SRCNN 和 AXI 互联，再配置时钟、复位和地址。
+
+最终结构使用 HPM1 访问控制寄存器，通过 HPC0 访问 DDR，PL 工作频率约为 200 MHz。
+
+**2. Dummy Kernel**
+
+```text
+输入一个数 -> +1 -> 输出
+```
+
+先用简单计算验证传输链路，再替换成完整网络，将“系统连接问题”和“卷积计算问题”分开排查。
+
+**3. 综合、实现与调试**
+
+- 综合：设计能否转换成硬件，使用了哪些资源？
+- Implementation：布局布线后，设计能否满足时序要求？
+- DRC：有没有违反硬件设计规则？
+- Timing report：哪些路径限制了时钟频率？
+- ILA（Integrated Logic Analyzer）：用于观察 PL 内部信号，包括 Stream 的 `TVALID`、`TREADY`、`TLAST`，以及复位和数据变化。
+
+**案例三：aux_reset_in 复位配置修正**
+
+系统集成时，辅助复位输入 `aux_reset_in` 已配置为低电平有效，却将这个未使用的输入接到了常量 `0`，导致 AXI 互联、DMA 和 SRCNN 一直处于复位状态，无法正常工作。修复时将该输入改接常量 `1`，重新生成硬件，并通过仿真确认复位能够正常释放。
+
 ## 8. 正确性、性能与资源评估
 
-> - Golden、HLS C simulation、RTL co-simulation 与板上输出如何逐级对齐？
-> - CPU baseline、kernel-only、DMA transaction 与端到端耗时的测量边界是什么？
-> - 如何计算 FPS、GOPS 与 speedup？MAC 是否按两次标量运算计数？
-> - 实际时钟、LUT/FF/BRAM/URAM/DSP、DDR 带宽如何限制性能？
-> - 如何用消融实验验证每项优化的贡献？测试次数和波动如何报告？
-> - 若测量功耗，测量范围与方法是什么？如何计算每帧能耗及能效？
-> - 实测瓶颈在哪里？若迁移到 ASIC，哪些结构需要重新设计？
+> - 软件参考、RTL 和板上输出的比较结果如何？连续帧与反压测试是否通过？
+> - 单帧耗时和 FPS 是多少，计时包含哪些环节？CPU baseline 的测试条件是什么，加速比是多少？重复测试的次数、中位数和波动如何？
+> - 最终时钟频率和 LUT、FF、BRAM、DSP 占用是多少？现有报告与实测结果支持哪些限制判断，还有什么改进空间？
+
+**“算得对吗、实际多快、用了多少资源？”**
+
+**1. 正确性验证**
+
+- 板级验证：Q20.12 原始测试覆盖预热、10 次重复运行、更换输入和模型、恢复原数据以及 overlay reload，输出均与对应的定点 Golden 逐位一致。
+- 独立 RTL 验证：连续运行两帧，中间不复位，第二帧更换输入和模型，输出逐位一致；通过施加输出停顿，检查反压期间的数据稳定性和 TLAST。
+
+**2. 实测性能**
+
+Q20.12 版本经过一次预热和 10 次重复测试，计时包含模型加载、DMA 传输和卷积计算，统计结果如下：
+
+| 指标 | 结果 |
+|---|---:|
+| 单帧耗时中位数 | 0.749866 s |
+| P95 耗时 | 0.749964 s |
+| 中位数耗时倒数 | 约 1.334 FPS |
+
+CPU 对比使用 ARM 单线程标量 C++ baseline，编译器为 GCC 11.3.0，优化选项为 `-O3`：
+
+| 平台 | 耗时中位数 |
+|---|---:|
+| ARM 单线程标量 C++ baseline | 10.994657 s |
+| FPGA memory-to-memory | 0.755946 s |
+| 相对加速比 | **14.54×** |
+
+**3. 资源占用与当前限制**
+
+| 资源 | 使用量 | 占比 |
+|---|---:|---:|
+| LUT | **16,328** | 13.94% |
+| FF | **18,020** | 7.69% |
+| BRAM Tile | 97.5 | 67.71% |
+| DSP | 86 | 6.89% |
+
+当前设计的 BRAM 占用比例明显高于 DSP。后续增加计算并行度时，需要同时考虑缓存组织、存储端口与时序。
+
+## Reference
+
+**论文与官方文档**
+
+- Dong, C., Loy, C. C., He, K., & Tang, X. [Image Super-Resolution Using Deep Convolutional Networks](https://arxiv.org/abs/1501.00092)：SRCNN 原始论文。
+- AMD [Vitis High-Level Synthesis User Guide（UG1399）](https://docs.amd.com/r/en-US/ug1399-vitis-hls)：`ap_fixed`、循环流水线、展开、数组分区与 DATAFLOW。
+- AMD [AXI DMA LogiCORE IP Product Guide（PG021）](https://docs.amd.com/r/en-US/pg021_axi_dma)：MM2S/S2MM、寄存器配置与传输协议。
+- PYNQ [Overlay](https://pynq.readthedocs.io/en/latest/pynq_libraries/overlay.html) 与 [Allocate](https://pynq.readthedocs.io/en/latest/pynq_libraries/allocate.html)：硬件加载、连续内存 buffer 及缓存同步。
+- AMD [Vivado Design Analysis and Closure Techniques（UG906）](https://docs.amd.com/r/en-US/ug906-vivado-design-analysis) 与 [Programming and Debugging（UG908）](https://docs.amd.com/r/en-US/ug908-vivado-programming-debugging)：DRC、时序分析与 ILA 调试。
+
+**项目源码与验证记录**
+
+- SRCNN-HLS-Accelerator：[Q20.12 开发分支](https://github.com/Peanut-321/SRCNN-HLS-Accelerator/tree/optimize/official-q20-12)与[板级部署分支](https://github.com/Peanut-321/SRCNN-HLS-Accelerator/tree/deploy/vivado-pynq)。
+- [Conv1 累加写回与 II 修复报告](https://github.com/Peanut-321/SRCNN-HLS-Accelerator/blob/optimize/official-q20-12/results/p3-q20-12-conv1-writeback.md)与[复位接线审计](https://github.com/Peanut-321/SRCNN-HLS-Accelerator/blob/deploy/vivado-pynq/results/aero-reset-audit.md)：第四章和第七章的优化、排障依据。
+- [完整帧与连续两帧 RTL 验证](https://github.com/Peanut-321/SRCNN-HLS-Accelerator/blob/optimize/official-q20-12/results/p3-q20-12-full-frame-rtl.md)与[最终板级交付及验证说明](https://github.com/Peanut-321/SRCNN-HLS-Accelerator/blob/deploy/vivado-pynq/docs/board-delivery-final-en.md)：分别记录 RTL 与板测的版本、验证范围和计时边界。
+- [最终 V3 板测统计](https://github.com/Peanut-321/SRCNN-HLS-Accelerator/blob/deploy/vivado-pynq/docs/aero-team-progress.md)：重复测试的中位数、P95 与单帧耗时倒数。
+- [Q20.12 V3 最终交付包](https://github.com/Peanut-321/SRCNN-HLS-Accelerator/blob/deploy/vivado-pynq/deliverables/aero-local/srcnn_q20_12_v3_resetfix.zip)：第八章资源数据来自包内 `build_reports/post_route_utilization.rpt`。
